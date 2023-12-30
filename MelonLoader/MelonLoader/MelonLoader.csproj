@@ -1,0 +1,45 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net35</TargetFramework>
+		<LangVersion>Latest</LangVersion>
+		<AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<OutputPath>$(SolutionDir)Output\$(Configuration)\MelonLoader\</OutputPath>
+		<DocumentationFile>..\Output\$(Configuration)\MelonLoader\MelonLoader.xml</DocumentationFile>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+	</PropertyGroup>
+	<PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+		<DebugType>full</DebugType>
+		<DefineConstants>TRACE;NET35;DEBUG</DefineConstants>
+	</PropertyGroup>
+	<PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+		<DebugType>None</DebugType>
+		<DefineConstants>NET35</DefineConstants>
+	</PropertyGroup>
+	<PropertyGroup>
+		<RunPostBuildEvent>OnBuildSuccess</RunPostBuildEvent>
+	</PropertyGroup>
+	<ItemDefinitionGroup>
+		  <PackageReference>
+				<PrivateAssets>all</PrivateAssets>
+		  </PackageReference>
+   </ItemDefinitionGroup>
+	<ItemGroup>
+		<Compile Update="Properties\Resources.Designer.cs">
+			<AutoGen>True</AutoGen>
+			<DesignTime>True</DesignTime>
+			<DependentUpon>Resources.resx</DependentUpon>
+		</Compile>
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="AssetRipper.VersionUtilities" Version="1.2.1" />
+		<PackageReference Include="AssetsTools.NET" Version="3.0.0-preview1" />
+		<PackageReference Include="HarmonyX" Version="2.9.0" />
+		<PackageReference Include="Samboy063.Tomlet" Version="5.0.0" />
+		<PackageReference Include="bHapticsLib" Version="1.0.6" />
+	</ItemGroup>
+	<ItemGroup>
+		<None Include="Resources\classdata.tpk" />
+	</ItemGroup>
+</Project>
