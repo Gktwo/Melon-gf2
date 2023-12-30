@@ -1,0 +1,387 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+
+namespace LibCpp2IL
+{
+    public class ClassReadingBinaryReader : EndianAwareBinaryReader
+    {
+        private static readonly Dictionary<Type, FieldInfo[]> CachedFields = new();
+
+        private SpinLock PositionShiftLock;
+
+        public bool is32Bit;
+        private MemoryStream _memoryStream;
+
+
+        public ClassReadingBinaryReader(MemoryStream input) : base(input)
+        {
+            _memoryStream = input;
+        }
+
+        public long Position
+        {
+            get => BaseStream.Position;
+            protected set => BaseStream.Position = value;
+        }
+
+        internal virtual object? ReadPrimitive(Type type, bool overrideArchCheck = false)
+        {
+            if (type == typeof(bool))
+                return ReadBoolean();
+
+            if (type == typeof(char))
+                return ReadChar();
+
+            if (type == typeof(int))
+                return ReadInt32();
+
+            if (type == typeof(uint))
+                return ReadUInt32();
+
+            if (type == typeof(short))
+                return ReadInt16();
+
+            if (type == typeof(ushort))
+                return ReadUInt16();
+
+            if (type == typeof(sbyte))
+                return ReadSByte();
+
+            if (type == typeof(byte))
+                return ReadByte();
+
+            if (type == typeof(long))
+                return is32Bit && !overrideArchCheck ? ReadInt32() : ReadInt64();
+
+            if (type == typeof(ulong))
+                return is32Bit && !overrideArchCheck ? ReadUInt32() : ReadUInt64();
+
+            if (type == typeof(float))
+                return ReadSingle();
+
+            if (type == typeof(double))
+                return ReadDouble();
+
+            return null;
+        }
+
+        private Dictionary<FieldInfo, bool> _cachedNoSerialize = new();
+
+        public T ReadClassAtRawAddr<T>(long offset, bool overrideArchCheck = false) where T : new()
+        {
+            var obtained = false;
+            PositionShiftLock.Enter(ref obtained);
+
+            if (!obtained)
+                throw new Exception("Failed to obtain lock");
+
+            try
+            {
+                if (offset >= 0)
+                    Position = offset;
+
+
+                return InternalReadClass<T>(overrideArchCheck);
+            }
+            finally
+            {
+                PositionShiftLock.Exit();
+            }
+        }
+
+        public uint ReadUnityCompressedUIntAtRawAddr(long offset, out int bytesRead)
+        {
+            var obtained = false;
+            PositionShiftLock.Enter(ref obtained);
+
+            if (!obtained)
+                throw new Exception("Failed to obtain lock");
+
+            try
+            {
+                if (offset >= 0)
+                    Position = offset;
+
+                //Ref Unity.IL2CPP.dll, Unity.IL2CPP.Metadata.MetadataUtils::WriteCompressedUInt32
+                //Read first byte
+                var b = ReadByte();
+                bytesRead = 1;
+                if (b < 128)
+                    return b;
+                if (b == 240)
+                {
+                    //Full Uint
+                    bytesRead = 5;
+                    return ReadUInt32();
+                }
+
+                //Special constant values
+                if (b == byte.MaxValue)
+                    return uint.MaxValue;
+                if (b == 254)
+                    return uint.MaxValue - 1;
+
+                if ((b & 192) == 192)
+                {
+                    //3 more to read
+                    bytesRead = 4;
+                    return (b & ~192U) << 24 | (uint) (ReadByte() << 16) | (uint) (ReadByte() << 8) | ReadByte();
+                }
+
+                if ((b & 128) == 128)
+                {
+                    //1 more to read
+                    bytesRead = 2;
+                    return (b & ~128U) << 8 | ReadByte();
+                }
+
+
+                throw new Exception($"How did we even get here? Invalid compressed int first byte {b}");
+            }
+            finally
+            {
+                PositionShiftLock.Exit();
+            }
+        }
+
+        public int ReadUnityCompressedIntAtRawAddr(long position, out int bytesRead)
+        {
+            //Ref libil2cpp, il2cpp\utils\ReadCompressedInt32
+            var unsigned = ReadUnityCompressedUIntAtRawAddr(position, out bytesRead);
+
+            if (unsigned == uint.MaxValue)
+                return int.MinValue;
+
+            var isNegative = (unsigned & 1) == 1;
+            unsigned >>= 1;
+            if (isNegative)
+                return -(int) (unsigned + 1);
+
+            return (int) unsigned;
+        }
+
+        private T InternalReadClass<T>(bool overrideArchCheck = false) where T : new()
+        {
+            return (T) InternalReadClass(typeof(T), overrideArchCheck);
+        }
+
+        private object InternalReadClass(Type type, bool overrideArchCheck = false)
+        {
+            var t = Activator.CreateInstance(type);
+            
+            if (type.IsPrimitive)
+            {
+                return ReadAndConvertPrimitive(overrideArchCheck, type);
+            }
+
+            if (type.IsEnum)
+            {
+                var value = ReadPrimitive(type.GetEnumUnderlyingType());
+
+                return value!;
+            }
+
+            ReadClassFieldwise(overrideArchCheck, t);
+
+            return t;
+        }
+
+        private object ReadAndConvertPrimitive(bool overrideArchCheck, Type type)
+        {
+            var value = ReadPrimitive(type, overrideArchCheck);
+
+            //32-bit fixes...
+            if (value is uint && type == typeof(ulong))
+                value = Convert.ToUInt64(value);
+            if (value is int && type == typeof(long))
+                value = Convert.ToInt64(value);
+
+            return value!;
+        }
+
+        private void ReadClassFieldwise<T>(bool overrideArchCheck, T t) where T : new()
+        {
+            if (t == null) 
+                throw new ArgumentNullException(nameof(t));
+            
+            foreach (var field in GetFieldsCached(t.GetType()))
+            {
+                if (!_cachedNoSerialize.ContainsKey(field))
+                    _cachedNoSerialize[field] = Attribute.GetCustomAttribute(field, typeof(NonSerializedAttribute)) != null;
+
+                if (_cachedNoSerialize[field]) continue;
+
+                if (!LibCpp2ILUtils.ShouldReadFieldOnThisVersion(field))
+                    continue;
+
+                if (field.FieldType.IsPrimitive)
+                {
+                    field.SetValue(t, ReadPrimitive(field.FieldType));
+                }
+                else
+                {
+                    field.SetValue(t, InternalReadClass(field.FieldType, overrideArchCheck));
+                }
+            }
+        }
+
+        public T[] ReadClassArrayAtRawAddr<T>(ulong offset, ulong count) where T : new() => ReadClassArrayAtRawAddr<T>((long) offset, (long) count);
+
+        public T[] ReadClassArrayAtRawAddr<T>(long offset, long count) where T : new()
+        {
+            var t = new T[count];
+
+            var obtained = false;
+            PositionShiftLock.Enter(ref obtained);
+
+            if (!obtained)
+                throw new Exception("Failed to obtain lock");
+
+            try
+            {
+                if (offset != -1) Position = offset;
+
+                for (var i = 0; i < count; i++)
+                {
+                    t[i] = InternalReadClass<T>();
+                }
+
+                return t;
+            }
+            finally
+            {
+                PositionShiftLock.Exit();
+            }
+        }
+
+        public string ReadStringToNull(ulong offset) => ReadStringToNull((long) offset);
+
+        public virtual string ReadStringToNull(long offset)
+        {
+
+            var obtained = false;
+            PositionShiftLock.Enter(ref obtained);
+
+            if (!obtained)
+                throw new Exception("Failed to obtain lock");
+
+            try
+            {
+                Position = offset;
+
+                return ReadStringToNullAtCurrentPos();
+            }
+            finally
+            {
+                PositionShiftLock.Exit();
+            }
+        }
+
+        public string ReadStringToNullAtCurrentPos()
+        {
+            var builder = new List<byte>();
+            byte b;
+            var sanity = 0;
+            while ((b = (byte)_memoryStream.ReadByte()) != 0 && ++sanity < 32768)
+                builder.Add(b);
+
+
+            return Encoding.UTF8.GetString(builder.ToArray());
+        }
+
+        public byte[] ReadByteArrayAtRawAddress(long offset, int count)
+        {
+            var obtained = false;
+            PositionShiftLock.Enter(ref obtained);
+
+            if (!obtained)
+                throw new Exception("Failed to obtain lock");
+
+            try
+            {
+                Position = offset;
+                var ret = new byte[count];
+                Read(ret, 0, count);
+
+                return ret;
+            }
+            finally
+            {
+                PositionShiftLock.Exit();
+            }
+        }
+
+        protected void WriteWord(int position, ulong word) => WriteWord(position, (long) word);
+
+        /// <summary>
+        /// Used for ELF Relocations.
+        /// </summary>
+        protected void WriteWord(int position, long word)
+        {
+            var obtained = false;
+            PositionShiftLock.Enter(ref obtained);
+
+            if (!obtained)
+                throw new Exception("Failed to obtain lock");
+
+            try
+            {
+                byte[] rawBytes;
+                if (is32Bit)
+                {
+                    var value = (int) word;
+                    rawBytes = BitConverter.GetBytes(value);
+                }
+                else
+                {
+                    rawBytes = BitConverter.GetBytes(word);
+                }
+
+                if (shouldReverseArrays)
+                    rawBytes = rawBytes.Reverse();
+
+                if (position > _memoryStream.Length)
+                    throw new Exception($"WriteWord: Position {position} beyond length {_memoryStream.Length}");
+
+                var count = is32Bit ? 4 : 8;
+                if (position + count > _memoryStream.Length)
+                    throw new Exception($"WriteWord: Writing {count} bytes at {position} would go beyond length {_memoryStream.Length}");
+
+                if (rawBytes.Length != count)
+                    throw new Exception($"WriteWord: Expected {count} bytes from BitConverter, got {position}");
+
+                try
+                {
+                    _memoryStream.Seek(position, SeekOrigin.Begin);
+                    _memoryStream.Write(rawBytes, 0, count);
+                }
+                catch
+                {
+                    Logging.LibLogger.ErrorNewline("WriteWord: Unexpected exception!");
+                    throw;
+                }
+            }
+            finally
+            {
+                PositionShiftLock.Exit();
+            }
+        }
+
+        private static FieldInfo[] GetFieldsCached(Type t)
+        {
+            if (CachedFields.TryGetValue(t, out var ret))
+                return ret;
+
+            CachedFields[t] = ret = t.GetFields();
+            return ret;
+        }
+
+        public ulong ReadNUint() => is32Bit ? ReadUInt32() : ReadUInt64();
+    }
+}
